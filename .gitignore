@@ -1,2 +1,5 @@
 /cmake-build-debug/
-.idea
+/a.out
+/events.log
+/pipes.log
+/.idea
