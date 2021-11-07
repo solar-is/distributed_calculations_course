@@ -8,7 +8,6 @@ SET(LINK_FLAGS "-L /mnt/c/Users/mprosolovich/CLionProjects/distributed_calculati
 SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${LINK_FLAGS}")
 
 add_executable(distributed
-        main.c
         pa23.c
         bank_robbery.c
         banking.h

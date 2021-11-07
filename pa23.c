@@ -1,257 +1,53 @@
-#include <sys/types.h>
-#include <stdbool.h>
-#include <stdarg.h>
-#include <stdlib.h>
-#include <getopt.h>
-#include <unistd.h>
-#include <signal.h>
-#include <stdio.h>
-#include <wait.h>
+#define _GNU_SOURCE //for pipe2()
+
+#include <time.h>
 #include <fcntl.h>
-#include <errno.h>
-#include <assert.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/wait.h>
 #include <string.h>
+#include <stdbool.h>
+#include <errno.h>
 #include <sched.h>
 
+#include "ipc.h"
+#include "common.h"
 #include "banking.h"
 #include "pa2345.h"
-#include "common.h"
-#include "ipc.h"
 
+/**
+clang -std=c99 -Wall -pedantic *.c -L /mnt/c/Users/mprosolovich/CLionProjects/distributed_calculations_course -lruntime
+export LD_LIBRARY_PATH="/mnt/c/Users/mprosolovich/CLionProjects/distributed_calculations_course"
+export LD_PRELOAD="/mnt/c/Users/mprosolovich/CLionProjects/distributed_calculations_course/libruntime.so"
+./pa2 –p 2 10 20
 
-struct ipc {
-    local_id n;
-    pid_t pid;
-    pid_t ppid;
-    local_id id;
-    balance_t balance;
-    FILE * const events_log;
+gdb tricks:
+set follow-fork-mode child
+set detach-on-fork off
 
-    struct {
-        int in;
-        int out;
-    } pipes[MAX_PROCESS_ID + 1];
-};
+to pack:
+tar -czvf pa2.tar.gz directory
+*/
 
-// c99 limitation
-int kill(pid_t pid, int sig);
+FILE *events_log_fd;
+FILE *pipes_log_fd;
+local_id children_cnt;
+int pipe_write_ends[MAX_PROCESS_ID][MAX_PROCESS_ID];
+int pipe_read_ends[MAX_PROCESS_ID][MAX_PROCESS_ID];
+balance_t balances[MAX_PROCESS_ID];
+pid_t *pids;
 
-
-static bool parse_args(int argc, char * argv[], local_id * n, balance_t ** balances) {
-    int opt;
-
-    local_id x;
-    bool p = false;
-    while ((opt = getopt(argc, argv, "p:")) > 0) {
-        if (opt == 'p') {
-            x = (local_id) atoi(optarg);
-            p = true;
-        }
+void die() {
+    for (int i = 0; i < children_cnt; ++i) {
+        kill(pids[i], SIGKILL);
     }
-
-    if (!p) {
-        return false;
-    }
-
-    if (argc - optind < x) {
-        return false;
-    }
-
-    *balances = malloc(sizeof(**balances) * *n);
-    if (!*balances) {
-        return false;
-    }
-
-    *n = x + 1;
-    for (int i = 0; i < x; ++i, ++optind) {
-        (*balances)[i] = atoi(argv[optind]);
-    }
-
-    return true;
+    exit(1);
 }
 
-static bool make_nonblock(int fd) {
-    const int flag = fcntl(fd, F_GETFL);
-
-    if (flag == -1) {
-        return false;
-    }
-
-    if (fcntl(fd, F_SETFL, flag | O_NONBLOCK) != 0) {
-        return false;
-    }
-
-    return true;
-}
-
-static bool open_pipes(int n, int ** in, int ** out) {
-    *in = malloc(n * n * sizeof(int));
-
-    if (!*in) {
-        return false;
-    }
-
-    *out = malloc(n * n * sizeof(int));
-    if (!*out) {
-        goto free_in;
-    }
-
-    FILE * const pipes_log_file = fopen(pipes_log, "w+");
-    if (pipes_log_file == NULL) {
-        goto free_out;
-    }
-
-    int k = 0;
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            if (i == j) {
-                (*in)[k] = -1;
-                (*out)[k] = -1;
-            } else {
-                int pipefd[2];
-
-                if (pipe(pipefd) < 0) {
-                    goto close_pipes;
-                }
-
-                if (!make_nonblock(pipefd[0])) {
-                    goto close_pipes;
-                }
-
-                if (!make_nonblock(pipefd[1])) {
-                    goto close_pipes;
-                }
-
-                (*in)[k] = pipefd[0];
-                (*out)[k] = pipefd[1];
-
-                fprintf(pipes_log_file, "%d / %d\n", pipefd[0], pipefd[1]);
-            }
-
-            ++k;
-        }
-    }
-
-    fclose(pipes_log_file);
-    return true;
-
-close_pipes:
-    for (int i = 0; i < k; ++i) {
-        if ((*in)[i] > 0) {
-            close((*in)[i]);
-        }
-
-        if ((*out)[i] > 0) {
-            close((*out)[i]);
-        }
-    }
-
-// close_pipes_log:
-    fclose(pipes_log_file);
-
-free_out:
-    free(*out);
-
-free_in:
-    free(*in);
-
-    return false;
-}
-
-static void free_pipes(int n, int * in, int * out) {
-    for (int i = 0, k = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j, ++k) {
-            if (i == j) {
-                continue;
-            }
-
-            if (in[k] > 0) {
-                close(in[k]);
-            }
-
-            if (out[k] > 0) {
-                close(out[k]);
-            }
-        }
-    }
-
-    free(in);
-    free(out);
-}
-
-static void save_my_pipes(int n, int p, int * in, int * out, struct ipc * ipc) {
-    for (int i = 0; i < n; ++i) {
-        ipc->pipes[i].in = in[p * n + i];
-        in[p * n + i] = -1;
-
-        ipc->pipes[i].out = out[i * n + p];
-        out[i * n + p] = -1;
-    }
-}
-
-static void close_pipes(struct ipc * ipc) {
-    for (int i = 0; i < ipc->n; ++i) {
-        if (ipc->pipes[i].in > 0) {
-            close(ipc->pipes[i].in);
-        }
-
-        if (ipc->pipes[i].out > 0) {
-            close(ipc->pipes[i].out);
-        }
-    }
-}
-
-static bool printf_message(Message * msg, MessageType type, const char * format, va_list ap) {
-    msg->s_header.s_magic = MESSAGE_MAGIC;
-    msg->s_header.s_type = type;
-
-    const int length = vsnprintf(msg->s_payload, MAX_PAYLOAD_LEN, format, ap);
-    if (length < 0) {
-        return false;
-    }
-
-    msg->s_header.s_payload_len = length;
-    return true;
-}
-
-static bool send_printf_message_multicast(struct ipc * ipc, MessageType type, const char * format, ...) {
-    Message msg;
-
-    va_list ap;
-    va_start(ap, format);
-    bool res = printf_message(&msg, type, format, ap);
-    va_end(ap);
-
-    if (!res) {
-        return false;
-    }
-
-    if (send_multicast(ipc, &msg)) {
-        return false;
-    }
-
-    return true;
-}
-
-static void log_msg(FILE * log_file, const char * format, ...) {
-    va_list ap;
-
-    va_start(ap, format);
-    vprintf(format, ap);
-    va_end(ap);
-
-    fflush(stdout);
-
-    va_start(ap, format);
-    vfprintf(log_file, format, ap);
-    va_end(ap);
-
-    fflush(log_file);
-}
-
-static int receive_blocking(const struct ipc * ipc, local_id id, Message * msg) {
+int receive_sync(void *ipc, local_id id, Message *msg) {
     while (true) {
-        const int ret = receive((void *) ipc, id, msg);
+        const int ret = receive(ipc, id, msg);
 
         if (ret != 0) {
             if (errno == EWOULDBLOCK || errno == EAGAIN) {
@@ -264,324 +60,351 @@ static int receive_blocking(const struct ipc * ipc, local_id id, Message * msg) 
     }
 }
 
-static int subprocess_main(struct ipc ipc) {
-    int ret = 0;
+void transfer(void *parent_data, local_id src, local_id dst, balance_t amount) {
+    Message msg;
+    msg.s_header.s_magic = MESSAGE_MAGIC;
+    msg.s_header.s_type = TRANSFER;
+    msg.s_header.s_payload_len = sizeof(TransferOrder);
 
-    log_msg(ipc.events_log, log_started_fmt, get_physical_time(), ipc.id, ipc.pid, ipc.ppid, ipc.balance);
+    TransferOrder *transfer = (TransferOrder *) msg.s_payload;
+    transfer->s_src = src;
+    transfer->s_dst = dst;
+    transfer->s_amount = amount;
 
-    if (!send_printf_message_multicast(&ipc, STARTED, log_started_fmt, get_physical_time(), ipc.id, ipc.pid, ipc.ppid, ipc.balance)) {
-        ret = 1;
-        goto end;
+    //send request to src
+    send(pipe_write_ends[PARENT_ID], src, &msg);
+
+    //receive ACK from dst
+    receive_sync(pipe_read_ends[PARENT_ID], dst, &msg);
+
+    if (msg.s_header.s_type != ACK) {
+        perror("Expected ACK message type");
+        die();
+    }
+}
+
+int payload_size(MessageType message_type) {
+    if (message_type == ACK || message_type == STOP) {
+        return 0;
     }
 
-    for (local_id id = 1; id < ipc.n; ++id) {
-        if (id == ipc.id) {
-            continue;
-        }
-
-        Message msg;
-        if (receive_blocking(&ipc, id, &msg) < 0) {
-            ret = 2;
-            goto end;
-        }
-
-        assert(msg.s_header.s_type == STARTED);
+    if (message_type == STARTED) {
+        return strlen("0: Process 0 (pid 00000, parent 00000) has STARTED with balance $00\n");
+    } else if (message_type == DONE) {
+        return strlen("0: Process 0 has DONE with balance $00\n");
+    } else {
+        return MAX_PAYLOAD_LEN;
     }
+}
 
-    log_msg(ipc.events_log, log_received_all_started_fmt, get_physical_time(), ipc.id);
+Message *create_message(MessageType message_type, const char *payload) {
+    int payload_len = payload_size(message_type);
+    Message *msg = malloc(sizeof(MessageHeader) + payload_len);
+    msg->s_header.s_payload_len = payload_len;
+    msg->s_header.s_local_time = get_physical_time();
+    msg->s_header.s_type = message_type;
+    msg->s_header.s_magic = MESSAGE_MAGIC;
+    for (int i = 0; i < payload_len; i++)
+        msg->s_payload[i] = payload[i];
+    return msg;
+}
 
-    size_t done = 1;
-    bool current_done = false;
-    BalanceHistory history = { .s_id = ipc.id, .s_history_len = 0 };
+char *create_payload(MessageType message_type, local_id id) {
+    char *payload = malloc(payload_size(message_type));
+    if (message_type == STARTED) {
+        sprintf(payload, log_started_fmt, get_physical_time(), id, getpid(), getppid(), balances[id]);
+    } else if (message_type == DONE) {
+        sprintf(payload, log_done_fmt, get_physical_time(), id, balances[id]);
+    }
+    if (message_type == STOP || message_type == ACK) {
+        sprintf(payload, "");
+    }
+    return payload;
+}
+
+void do_send_multicast(local_id id, MessageType message_type) {
+    char *payload = create_payload(message_type, id);
+    Message *msg = create_message(message_type, payload);
+    send_multicast(pipe_write_ends[id], msg);
+    free(payload);
+    free(msg);
+}
+
+void wait_all_started_messages(local_id id) {
+    for (local_id i = 1; i <= children_cnt; ++i) {
+        if (i != id) {
+            Message msg;
+            receive_sync(pipe_read_ends[id], i, &msg);
+            if (msg.s_header.s_type != STARTED) {
+                perror("Expected STARTED message type");
+                die();
+            }
+        }
+    }
+}
+
+void wait_all_done_messages(local_id id) {
+    for (local_id i = 1; i <= children_cnt; ++i) {
+        if (i != id) {
+            Message msg;
+            receive_sync(pipe_read_ends[id], i, &msg);
+            if (msg.s_header.s_type != DONE) {
+                perror("Expected DONE message type");
+                die();
+            }
+        }
+    }
+}
+
+void wait_balance_history_messages(local_id id, AllHistory *all_history) {
+    for (local_id i = 1; i <= children_cnt; ++i) {
+        if (i != id) {
+            Message msg;
+            receive_sync(pipe_read_ends[id], i, &msg);
+            if (msg.s_header.s_type != BALANCE_HISTORY) {
+                perror("Expected BALANCE_HISTORY message type");
+                die();
+            }
+            BalanceHistory *balance_history = (BalanceHistory *) msg.s_payload;
+            all_history->s_history[i - 1].s_id = balance_history->s_id;
+            all_history->s_history[i - 1].s_history_len = balance_history->s_history_len;
+            for (size_t j = 0; j < balance_history->s_history_len; ++j) {
+                all_history->s_history[i - 1].s_history[j] = balance_history->s_history[j];
+            }
+        }
+    }
+}
+
+void log_started(timestamp_t timestamp, local_id id, balance_t balance) {
+    printf(log_started_fmt, timestamp, id, getpid(), getppid(), balance);
+    fprintf(events_log_fd, log_started_fmt, timestamp, id, getpid(), getppid(), balance);
+}
+
+void log_receive_all_started(timestamp_t timestamp, local_id id) {
+    printf(log_received_all_started_fmt, timestamp, id);
+    fprintf(events_log_fd, log_received_all_started_fmt, timestamp, id);
+}
+
+void log_work_done(timestamp_t timestamp, local_id id, balance_t balance) {
+    printf(log_done_fmt, timestamp, id, balance);
+    fprintf(events_log_fd, log_done_fmt, timestamp, id, balance);
+}
+
+void log_transfer_out(timestamp_t timestamp, local_id src_id, local_id dst_id, balance_t balance) {
+    printf(log_transfer_out_fmt, timestamp, src_id, balance, dst_id);
+    fprintf(events_log_fd, log_transfer_out_fmt, timestamp, src_id, balance, dst_id);
+}
+
+void log_transfer_in(timestamp_t timestamp, local_id receiver_id, local_id sender_id, balance_t balance) {
+    printf(log_transfer_in_fmt, timestamp, receiver_id, balance, sender_id);
+    fprintf(events_log_fd, log_transfer_out_fmt, timestamp, receiver_id, balance, sender_id);
+}
+
+void log_receive_all_done(timestamp_t timestamp, local_id id) {
+    printf(log_received_all_done_fmt, timestamp, id);
+    fprintf(events_log_fd, log_received_all_done_fmt, timestamp, id);
+}
+
+void init_pipes() {
+    for (local_id i = 0; i <= children_cnt; i++) {
+        for (local_id j = 0; j <= children_cnt; j++) {
+            if (i == j) {
+                pipe_read_ends[j][i] = -1;
+                pipe_write_ends[i][j] = -1;
+            } else {
+                int pipe_ends[2];
+                pipe2(pipe_ends, O_NONBLOCK);
+                fprintf(pipes_log_fd, "Initiating pipe between %d and %d: %i %i\n", i, j, pipe_ends[0], pipe_ends[1]);
+                pipe_read_ends[j][i] = pipe_ends[0];
+                pipe_write_ends[i][j] = pipe_ends[1];
+            }
+        }
+    }
+    fclose(pipes_log_fd); //not useful anymore
+}
+
+void close_pipe_end(const int *pipe_end) {
+    if (*pipe_end > 0) {
+        close(*pipe_end);
+    }
+}
+
+void close_unused_pipe_ends(local_id id) {
+    for (local_id i = 0; i <= children_cnt; i++) {
+        for (local_id j = 0; (i != id) && (j <= children_cnt); j++) {
+            close_pipe_end(&pipe_read_ends[i][j]);
+            close_pipe_end(&pipe_write_ends[i][j]);
+        }
+    }
+}
+
+void close_used_pipe_ends(local_id id) {
+    for (local_id j = 0; j <= children_cnt; j++) {
+        close_pipe_end(&pipe_read_ends[id][j]);
+        close_pipe_end(&pipe_write_ends[id][j]);
+    }
+}
+
+void children_routine(local_id id) {
+    close_unused_pipe_ends(id);
+    log_started(get_physical_time(), id, balances[id]);
+    do_send_multicast(id, STARTED);
+    wait_all_started_messages(id);
+    log_receive_all_started(get_physical_time(), id);
+
+    size_t ended_processes_cnt = 0;
+    BalanceHistory cur_balance_history = {
+            .s_id = id,
+            .s_history_len = 0
+    };
     while (true) {
         Message msg;
+        receive_any(pipe_read_ends[id], &msg);
 
-        if (receive_any(&ipc, &msg) != 0) {
-            ret = 3;
-            goto end;
+        timestamp_t t = get_physical_time();
+        for (timestamp_t i = cur_balance_history.s_history_len; i < t; ++i) {
+            cur_balance_history.s_history[i].s_time = i;
+            cur_balance_history.s_history[i].s_balance = balances[id];
+            cur_balance_history.s_history[i].s_balance_pending_in = 0;
         }
-
-        const timestamp_t t = get_physical_time();
-        for (timestamp_t i = history.s_history_len; i < t; ++i) {
-            history.s_history[i].s_time = i;
-            history.s_history[i].s_balance = ipc.balance;
-            history.s_history[i].s_balance_pending_in = 0;
-        }
-
-        history.s_history_len = t;
+        cur_balance_history.s_history_len = t;
 
         switch (msg.s_header.s_type) {
             case TRANSFER: {
-                const TransferOrder * const transfer = (TransferOrder *) msg.s_payload;
+                TransferOrder *transfer = (TransferOrder *) msg.s_payload;
 
-                assert((!current_done && ipc.id == transfer->s_src) || ipc.id == transfer->s_dst);
-
-                if (ipc.id == transfer->s_src) {
-                    ipc.balance -= transfer->s_amount;
-
-                    if (send(&ipc, transfer->s_dst, &msg) != 0) {
-                        ret = 4;
-                        goto end;
-                    }
-
-                    log_msg(ipc.events_log, log_transfer_out_fmt, t, ipc.id, transfer->s_amount, transfer->s_dst);
+                if (id == transfer->s_src) {
+                    balances[id] -= transfer->s_amount;
+                    send(pipe_write_ends[id], transfer->s_dst, &msg);
+                    log_transfer_out(t, id, transfer->s_dst, transfer->s_amount);
                 } else {
-                    log_msg(ipc.events_log, log_transfer_in_fmt, t, ipc.id, transfer->s_amount, transfer->s_src);
-
-                    ipc.balance += transfer->s_amount;
-
-                    Message ack;
-                    ack.s_header.s_magic = MESSAGE_MAGIC;
-                    ack.s_header.s_type = ACK;
-                    ack.s_header.s_payload_len = 0;
-
-                    if (send(&ipc, PARENT_ID, &ack) != 0) {
-                        ret = 5;
-                        goto end;
-                    }
+                    log_transfer_in(t, id, transfer->s_src, transfer->s_amount);
+                    balances[id] += transfer->s_amount;
+                    send(pipe_write_ends[id], PARENT_ID, create_message(ACK, create_payload(ACK, id)));
                 }
-
                 break;
             }
 
-            case STOP:
-                assert(!current_done);
-
-                current_done = true;
-                ++done;
-
-                log_msg(ipc.events_log, log_done_fmt, get_physical_time(), ipc.id, ipc.balance);
-                if (!send_printf_message_multicast(&ipc, DONE, log_done_fmt, get_physical_time(), ipc.id, ipc.balance)) {
-                    ret = 6;
-                    goto end;
-                }
-
-                break;
-
-            case DONE:
-                ++done;
-
-                if (done == ipc.n) {
-                    goto break_while;
-                }
-
-                break;
-        }
-    }
-
-break_while: ;
-    history.s_history[history.s_history_len].s_time = history.s_history_len;
-    history.s_history[history.s_history_len].s_balance = ipc.balance;
-    history.s_history[history.s_history_len].s_balance_pending_in = 0;
-    ++history.s_history_len;
-
-    Message msg;
-    msg.s_header.s_magic = MESSAGE_MAGIC;
-    msg.s_header.s_type = BALANCE_HISTORY;
-    msg.s_header.s_payload_len = offsetof(BalanceHistory, s_history) + sizeof(BalanceState) * history.s_history_len;
-    memcpy(msg.s_payload, &history, msg.s_header.s_payload_len);
-
-    if (send(&ipc, PARENT_ID, &msg) != 0) {
-        ret = 7;
-        goto end;
-    }
-
-    log_msg(ipc.events_log, log_received_all_done_fmt, get_physical_time(), ipc.id);
-
-end:
-    close_pipes(&ipc);
-    fclose(ipc.events_log);
-    return ret;
-}
-
-static bool start_processes(local_id n, struct ipc * ipc, pid_t ** pids, const balance_t * balances) {
-    *pids = malloc(n * sizeof(pid_t));
-
-    if (!*pids) {
-        return false;
-    }
-
-    (*pids)[0] = 0;
-
-    FILE * const events_log_file = fopen(events_log, "a+");
-    if (events_log_file == NULL) {
-        goto free_pids;
-    }
-
-    int * in, * out;
-    if (!open_pipes(n, &in, &out)) {
-        goto close_events_log;
-    }
-
-    const pid_t parent_pid = getpid();
-
-    int i = 1;
-    for (; i < n; ++i) {
-        const pid_t pid = fork();
-
-        if (pid < 0) {
-            goto end_processes;
-        }
-
-        if (pid == 0) {
-            struct ipc child_ipc = {
-                .n = n,
-                .pid = getpid(),
-                .ppid = parent_pid,
-                .balance = balances[i - 1],
-                .id = (local_id) i,
-                .events_log = events_log_file,
-            };
-
-            save_my_pipes(n, i, in, out, &child_ipc);
-            free_pipes(n, in, out);
-
-            exit(subprocess_main(child_ipc));
-        }
-
-        (*pids)[i] = pid;
-    }
-
-    ipc->n = n;
-    ipc->pid = parent_pid;
-    ipc->ppid = parent_pid;
-    ipc->id = PARENT_ID;
-
-    save_my_pipes(n, PARENT_ID, in, out, ipc);
-    free_pipes(n, in, out);
-
-    fclose(events_log_file);
-    return true;
-
-end_processes:
-    for (int j = 1; j < i; ++j) {
-        kill((*pids)[j], SIGKILL);
-    }
-
-// free_pipes:
-    free_pipes(n, in, out);
-
-close_events_log:
-    fclose(events_log_file);
-
-free_pids:
-    free(*pids);
-
-    return false;
-}
-
-static bool main_work(struct ipc * ipc, const pid_t * pids) {
-    for (local_id id = 1; id < ipc->n; ++id) {
-        Message msg;
-
-        if (receive_blocking(ipc, id, &msg) < 0) {
-            return false;
-        }
-
-        assert(msg.s_header.s_type == STARTED);
-    }
-
-    bank_robbery(ipc, ipc->n - 1);
-
-    {
-        Message msg;
-
-        msg.s_header.s_magic = MESSAGE_MAGIC;
-        msg.s_header.s_type = STOP;
-        msg.s_header.s_payload_len = 0;
-
-        if (send_multicast(ipc, &msg) < 0) {
-            return false;
-        }
-    }
-
-    for (local_id id = 1; id < ipc->n; ++id) {
-        Message msg;
-
-        if (receive_blocking(ipc, id, &msg) < 0) {
-            return false;
-        }
-
-        assert(msg.s_header.s_type == DONE);
-    }
-
-    AllHistory allHistory;
-    allHistory.s_history_len = ipc->n - 1;
-
-    for (local_id id = 1; id < ipc->n; ++id) {
-        Message msg;
-
-        if (receive_blocking(ipc, id, &msg) < 0) {
-            return false;
-        }
-
-        assert(msg.s_header.s_type == BALANCE_HISTORY);
-
-        const BalanceHistory * const history = (BalanceHistory *) msg.s_payload;
-
-        allHistory.s_history[id - 1].s_id = history->s_id;
-        allHistory.s_history[id - 1].s_history_len = history->s_history_len;
-
-        for (size_t i = 0; i < history->s_history_len; ++i) {
-            allHistory.s_history[id - 1].s_history[i] = history->s_history[i];
-        }
-    }
-
-    print_history(&allHistory);
-
-    for (int i = 1; i < ipc->n; ++i) {
-        if (waitpid(pids[i], NULL, 0) < 0) {
-            if (errno == ECHILD) {
+            case STOP: {
+                ++ended_processes_cnt; //we are ended now
+                log_work_done(get_physical_time(), id, balances[id]);
+                do_send_multicast(id, DONE);
                 break;
             }
 
-            return false;
+            case DONE: {
+                ++ended_processes_cnt;
+                if (ended_processes_cnt == children_cnt) { // no more to wait
+                    cur_balance_history.s_history[cur_balance_history.s_history_len].s_time = cur_balance_history.s_history_len;
+                    cur_balance_history.s_history[cur_balance_history.s_history_len].s_balance = balances[id];
+                    cur_balance_history.s_history[cur_balance_history.s_history_len].s_balance_pending_in = 0;
+                    ++cur_balance_history.s_history_len;
+
+                    Message balance_history_msg;
+                    balance_history_msg.s_header.s_magic = MESSAGE_MAGIC;
+                    balance_history_msg.s_header.s_type = BALANCE_HISTORY;
+                    balance_history_msg.s_header.s_payload_len =
+                            offsetof(BalanceHistory, s_history) +
+                            sizeof(BalanceState) * cur_balance_history.s_history_len;
+                    memcpy(balance_history_msg.s_payload, &cur_balance_history,
+                           balance_history_msg.s_header.s_payload_len);
+
+                    send(pipe_write_ends[id], PARENT_ID, &balance_history_msg);
+                    log_receive_all_done(get_physical_time(), id);
+
+                    close_used_pipe_ends(id);
+                    fclose(events_log_fd);
+                    exit(0);
+                }
+                break;
+            }
+        }
+    }
+}
+
+void init_children() {
+    pids = malloc(sizeof(pid_t) * children_cnt);
+    for (local_id i = 0; i < children_cnt; i++) {
+        //PARENT_ID is always 0, so we need to add 1
+        local_id id = (local_id) (i + 1);
+        int fork_res = fork();
+        if (fork_res == 0) {
+            pids[i] = getpid();
+            children_routine(id);
+        }
+    }
+}
+
+void parent_routine() {
+    close_unused_pipe_ends(PARENT_ID);
+    wait_all_started_messages(PARENT_ID);
+
+    bank_robbery(NULL, children_cnt);
+
+    do_send_multicast(PARENT_ID, STOP);
+    wait_all_done_messages(PARENT_ID);
+
+    AllHistory all_history;
+    all_history.s_history_len = children_cnt;
+    wait_balance_history_messages(PARENT_ID, &all_history);
+    print_history(&all_history);
+
+    while (true) {
+        if (children_cnt == 0) {
+            //no more to wait
+            break;
+        }
+
+        if (waitpid(-1, NULL, 0) > 0) {
+            children_cnt--;
+        }
+    }
+    close_used_pipe_ends(PARENT_ID);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 3 || strcmp(argv[1], "-p") != 0) {
+        perror("Argument '-p' should be present - number of child processes, and then balances for each of them");
+        exit(1);
+    } else {
+        children_cnt = atoi(argv[2]);
+        if (argc != 3 + children_cnt) {
+            perror("Provide balances for all processes please");
+            exit(1);
+        }
+        for (int i = 1; i <= children_cnt; ++i) {
+            balances[i] = atoi(argv[2 + i]);
         }
     }
 
-    return true;
-}
-
-int main(int argc, char * argv[]) {
-    local_id n;
-
-    balance_t * balances;
-    if (!parse_args(argc, argv, &n, &balances)) {
-        return 1;
-    }
-
-    pid_t * pids;
-    struct ipc ipc;
-    if (!start_processes(n, &ipc, &pids, balances)) {
-        perror("Cannot create processes");
-        free(balances);
-        return 2;
-    }
-
-    if (!main_work(&ipc, pids)) {
-        perror("Error");
-        close_pipes(&ipc);
-        free(pids);
-        free(balances);
-        return 3;
-    }
-
-    close_pipes(&ipc);
-    free(pids);
-    free(balances);
+    pipes_log_fd = fopen(pipes_log, "w");
+    events_log_fd = fopen(events_log, "a");
+    init_pipes();
+    init_children();
+    parent_routine();
+    fclose(events_log_fd);
     return 0;
 }
 
-static bool write_full(int fd, const void * buf, size_t remaining) {
-    const uint8_t * ptr = buf;
+int send(void *self, local_id dst, const Message *msg) {
+    if (msg == NULL || self == NULL) {
+        perror("Null arguments passed to send");
+        return 3;
+    }
+
+    int *write_end = (int *) self;
+
+    const uint8_t *ptr = (const uint8_t *) msg;
+
+    ssize_t remaining = (ssize_t) sizeof(MessageHeader) + msg->s_header.s_payload_len;
 
     if (remaining == 0) {
-        return true;
+        return 0;
     }
 
     errno = 0;
     while (true) {
-        const ssize_t wrote = write(fd, ptr, remaining);
+        const ssize_t wrote = write(write_end[dst], ptr, remaining);
 
         if (wrote < 0) {
             if (errno == EWOULDBLOCK || errno == EAGAIN) {
@@ -596,32 +419,27 @@ static bool write_full(int fd, const void * buf, size_t remaining) {
         ptr += wrote;
 
         if (remaining == 0) {
-            return true;
+            return 0;
         }
     }
 
-    return false;
+    return -1;
 }
 
-int send(void * self, local_id dst, const Message * msg) {
-    struct ipc * const ipc = self;
-
-    if (!write_full(ipc->pipes[dst].out, msg, sizeof(MessageHeader) + msg->s_header.s_payload_len)) {
-        return -1;
+int send_multicast(void *self, const Message *msg) {
+    if (msg == NULL || self == NULL) {
+        perror("Null arguments passed to send_multicast");
+        return 3;
     }
 
-    return 0;
-}
+    int *write_end = (int *) self;
 
-int send_multicast(void * self, const Message * msg) {
-    struct ipc * const ipc = self;
-
-    for (local_id id = 0; id < ipc->n; ++id) {
-        if (id == ipc->id) {
+    for (local_id id = 0; id <= children_cnt; ++id) {
+        if (write_end[id] < 0) {
             continue;
         }
 
-        if (send(ipc, id, msg) != 0) {
+        if (send(self, id, msg) != 0) {
             return -1;
         }
     }
@@ -629,8 +447,8 @@ int send_multicast(void * self, const Message * msg) {
     return 0;
 }
 
-static bool read_full(int fd, void * buf, size_t remaining) {
-    uint8_t * ptr = buf;
+static bool read_in_loop(int fd, void *buf, size_t remaining) {
+    uint8_t *ptr = buf;
 
     if (remaining == 0) {
         return true;
@@ -670,14 +488,19 @@ static bool read_full(int fd, void * buf, size_t remaining) {
     return false;
 }
 
-int receive(void * self, local_id from, Message * msg) {
-    struct ipc * const ipc = self;
+int receive(void *self, local_id from, Message *msg) {
+    if (msg == NULL || self == NULL) {
+        perror("Null arguments passed to receive");
+        return 3;
+    }
 
-    if (!read_full(ipc->pipes[from].in, &(msg->s_header), sizeof(MessageHeader))) {
+    int *read_end = (int *) self;
+
+    if (!read_in_loop(read_end[from], &(msg->s_header), sizeof(MessageHeader))) {
         return -1;
     }
 
-    while (!read_full(ipc->pipes[from].in, msg->s_payload, msg->s_header.s_payload_len)) {
+    while (!read_in_loop(read_end[from], msg->s_payload, msg->s_header.s_payload_len)) {
         if (errno == EWOULDBLOCK || errno == EAGAIN) {
             sched_yield();
             continue;
@@ -689,16 +512,21 @@ int receive(void * self, local_id from, Message * msg) {
     return 0;
 }
 
-int receive_any(void * self, Message * msg) {
-    struct ipc * const ipc = self;
+int receive_any(void *self, Message *msg) {
+    if (msg == NULL || self == NULL) {
+        perror("Null arguments passed to receive_any");
+        return 3;
+    }
+
+    int *read_end = (int *) self;
 
     while (true) {
-        for (local_id id = 0; id < ipc->n; ++id) {
-            if (id == ipc->id) {
+        for (local_id id = 0; id <= children_cnt; ++id) {
+            if (read_end[id] < 0) {
                 continue;
             }
 
-            if (receive(ipc, id, msg) == 0) {
+            if (receive(self, id, msg) == 0) {
                 return 0;
             }
 
@@ -709,23 +537,4 @@ int receive_any(void * self, Message * msg) {
 
         sched_yield();
     }
-}
-
-void transfer(void * parent_data, local_id src, local_id dst, balance_t amount) {
-    const struct ipc * ipc = parent_data;
-
-    assert(ipc->id == PARENT_ID);
-
-    Message msg;
-    msg.s_header.s_magic = MESSAGE_MAGIC;
-    msg.s_header.s_type = TRANSFER;
-    msg.s_header.s_payload_len = sizeof(TransferOrder);
-    TransferOrder * const transfer = (TransferOrder *) msg.s_payload;
-    transfer->s_src = src;
-    transfer->s_dst = dst;
-    transfer->s_amount = amount;
-    send(parent_data, src, &msg);
-
-    receive_blocking(parent_data, dst, &msg);
-    assert(msg.s_header.s_type == ACK);
 }
