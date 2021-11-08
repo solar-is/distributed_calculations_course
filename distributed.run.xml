@@ -1,5 +1,5 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="distributed" type="CMakeRunConfiguration" factoryName="Application" PROGRAM_PARAMS="-p 5 10 20 33 44 55" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="distributed" TARGET_NAME="distributed" CONFIG_NAME="Debug" RUN_TARGET_PROJECT_NAME="distributed" RUN_TARGET_NAME="distributed">
+  <configuration default="false" name="distributed" type="CMakeRunConfiguration" factoryName="Application" PROGRAM_PARAMS="-p 5 10 20 30 40 50" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="distributed" TARGET_NAME="distributed" CONFIG_NAME="Debug" RUN_TARGET_PROJECT_NAME="distributed" RUN_TARGET_NAME="distributed">
     <envs>
       <env name="LD_LIBRARY_PATH" value="/mnt/c/Users/mprosolovich/CLionProjects/distributed_calculations_course" />
       <env name="LD_PRELOAD" value="/mnt/c/Users/mprosolovich/CLionProjects/distributed_calculations_course/libruntime.so" />

@@ -408,9 +408,14 @@ int process_send(void *self, local_id dst, const Message *msg) {
 }
 
 Message *adjust_local_time(const Message *msg) {
-    Message *adjusted = malloc(sizeof(Message));
-    *adjusted = *msg;
+    Message *adjusted = malloc(
+            sizeof(MessageHeader) + sizeof(char) * msg->s_header.s_payload_len
+    );
+    adjusted->s_header = msg->s_header;
     adjusted->s_header.s_local_time = l_time;
+    for (int i = 0; i < msg->s_header.s_payload_len; ++i) {
+        adjusted->s_payload[i] = msg->s_payload[i];
+    }
     return adjusted;
 }
 
