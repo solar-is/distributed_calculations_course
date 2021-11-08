@@ -407,26 +407,20 @@ int process_send(void *self, local_id dst, const Message *msg) {
     return -1;
 }
 
-Message *adjust_local_time(const Message *msg) {
-    Message *adjusted = malloc(
-            sizeof(MessageHeader) + sizeof(char) * msg->s_header.s_payload_len
-    );
-    adjusted->s_header = msg->s_header;
-    adjusted->s_header.s_local_time = l_time;
-    for (int i = 0; i < msg->s_header.s_payload_len; ++i) {
-        adjusted->s_payload[i] = msg->s_payload[i];
-    }
-    return adjusted;
-}
-
 int send(void *self, local_id dst, const Message *msg) {
     if (msg == NULL || self == NULL) {
         perror("Null arguments passed to send");
         return 3;
     }
     ++l_time;
-    msg = adjust_local_time(msg);
-    return process_send(self, dst, msg);
+
+    Message adjusted;
+    adjusted.s_header = msg->s_header;
+    adjusted.s_header.s_local_time = l_time;
+    for (int i = 0; i < msg->s_header.s_payload_len; ++i) {
+        adjusted.s_payload[i] = msg->s_payload[i];
+    }
+    return process_send(self, dst, &adjusted);
 }
 
 int send_multicast(void *self, const Message *msg) {
@@ -435,13 +429,18 @@ int send_multicast(void *self, const Message *msg) {
         return 3;
     }
     ++l_time;
-    msg = adjust_local_time(msg);
+    Message adjusted;
+    adjusted.s_header = msg->s_header;
+    adjusted.s_header.s_local_time = l_time;
+    for (int i = 0; i < msg->s_header.s_payload_len; ++i) {
+        adjusted.s_payload[i] = msg->s_payload[i];
+    }
     int *write_end = (int *) self;
     for (local_id id = 0; id <= children_cnt; ++id) {
         if (write_end[id] < 0) {
             continue;
         }
-        if (process_send(self, id, msg) != 0) {
+        if (process_send(self, id, &adjusted) != 0) {
             return -1;
         }
     }
