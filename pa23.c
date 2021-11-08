@@ -36,6 +36,13 @@ int pipe_read_ends[MAX_PROCESS_ID][MAX_PROCESS_ID];
 balance_t balances[MAX_PROCESS_ID];
 pid_t *pids;
 
+timestamp_t l_time = 0;
+
+timestamp_t get_lamport_time() {
+    return l_time;
+}
+
+
 void die() {
     for (int i = 0; i < children_cnt; ++i) {
         kill(pids[i], SIGKILL);
@@ -71,9 +78,9 @@ char *
 create_payload(MessageType message_type, local_id id, TransferOrder *transferOrder) {
     char *payload = malloc(payload_size(message_type));
     if (message_type == STARTED) {
-        sprintf(payload, log_started_fmt, get_physical_time(), id, getpid(), getppid(), balances[id]);
+        sprintf(payload, log_started_fmt, get_lamport_time(), id, getpid(), getppid(), balances[id]);
     } else if (message_type == DONE) {
-        sprintf(payload, log_done_fmt, get_physical_time(), id, balances[id]);
+        sprintf(payload, log_done_fmt, get_lamport_time(), id, balances[id]);
     } else if (message_type == TRANSFER) {
         return (char *) transferOrder;
     } else if (message_type == STOP || message_type == ACK) {
@@ -90,7 +97,7 @@ create_message(MessageType message_type, local_id id, TransferOrder *transferOrd
     uint payload_len = strlen(payload);
     Message *msg = malloc(sizeof(MessageHeader) + payload_len);
     msg->s_header.s_payload_len = payload_len;
-    msg->s_header.s_local_time = get_physical_time();
+    msg->s_header.s_local_time = get_lamport_time();
     msg->s_header.s_type = message_type;
     msg->s_header.s_magic = MESSAGE_MAGIC;
     for (int i = 0; i < payload_len; i++)
@@ -243,10 +250,10 @@ void update_balance_history(local_id id, BalanceHistory *cur_balance_history, ti
 
 void children_routine(local_id id) {
     close_unused_pipe_ends(id);
-    log_started(get_physical_time(), id, balances[id]);
+    log_started(get_lamport_time(), id, balances[id]);
     send_multicast(pipe_write_ends[id], create_message(STARTED, id, NULL));
     wait_all_started_messages(id);
-    log_receive_all_started(get_physical_time(), id);
+    log_receive_all_started(get_lamport_time(), id);
 
     size_t ended_processes_cnt = 0;
     BalanceHistory cur_balance_history = {
@@ -256,8 +263,8 @@ void children_routine(local_id id) {
     while (1) {
         Message msg;
         receive_any(pipe_read_ends[id], &msg);
-        timestamp_t t = get_physical_time();
-        update_balance_history(id, &cur_balance_history, t);
+        timestamp_t time = get_lamport_time();
+        update_balance_history(id, &cur_balance_history, time);
 
         switch (msg.s_header.s_type) {
             case TRANSFER: {
@@ -265,24 +272,27 @@ void children_routine(local_id id) {
                 if (id == transfer->s_src) {
                     balances[id] -= transfer->s_amount;
                     send(pipe_write_ends[id], transfer->s_dst, &msg);
-                    log_transfer_out(t, id, transfer->s_dst, transfer->s_amount);
+                    log_transfer_out(time, id, transfer->s_dst, transfer->s_amount);
                 } else {
-                    log_transfer_in(t, id, transfer->s_src, transfer->s_amount);
+                    log_transfer_in(time, id, transfer->s_src, transfer->s_amount);
                     balances[id] += transfer->s_amount;
+                    for (int i = msg.s_header.s_local_time - 1; i < time; ++i) {
+                        cur_balance_history.s_history[i].s_balance_pending_in += transfer->s_amount;
+                    }
                     send(pipe_write_ends[id], PARENT_ID, create_message(ACK, id, NULL));
                 }
                 break;
             }
             case STOP: {
                 ++ended_processes_cnt; //we are ended now
-                log_work_done(get_physical_time(), id, balances[id]);
+                log_work_done(get_lamport_time(), id, balances[id]);
                 send_multicast(pipe_write_ends[id], create_message(DONE, id, NULL));
                 break;
             }
             case DONE: {
                 ++ended_processes_cnt;
                 if (ended_processes_cnt == children_cnt) { // no more to wait
-                    log_receive_all_done(get_physical_time(), id);
+                    log_receive_all_done(get_lamport_time(), id);
                     cur_balance_history.s_history[cur_balance_history.s_history_len].s_time = cur_balance_history.s_history_len;
                     cur_balance_history.s_history[cur_balance_history.s_history_len].s_balance = balances[id];
                     cur_balance_history.s_history[cur_balance_history.s_history_len].s_balance_pending_in = 0;
@@ -376,12 +386,7 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
-int send(void *self, local_id dst, const Message *msg) {
-    if (msg == NULL || self == NULL) {
-        perror("Null arguments passed to send");
-        return 3;
-    }
-
+int process_send(void *self, local_id dst, const Message *msg) {
     int *write_end = (int *) self;
     char *message_ptr = (char *) msg;
     ssize_t rem = (ssize_t) sizeof(MessageHeader) + msg->s_header.s_payload_len;
@@ -399,8 +404,24 @@ int send(void *self, local_id dst, const Message *msg) {
         }
         message_ptr += written;
     }
-
     return -1;
+}
+
+Message *adjust_local_time(const Message *msg) {
+    Message *adjusted = malloc(sizeof(Message));
+    *adjusted = *msg;
+    adjusted->s_header.s_local_time = l_time;
+    return adjusted;
+}
+
+int send(void *self, local_id dst, const Message *msg) {
+    if (msg == NULL || self == NULL) {
+        perror("Null arguments passed to send");
+        return 3;
+    }
+    ++l_time;
+    msg = adjust_local_time(msg);
+    return process_send(self, dst, msg);
 }
 
 int send_multicast(void *self, const Message *msg) {
@@ -408,13 +429,14 @@ int send_multicast(void *self, const Message *msg) {
         perror("Null arguments passed to send_multicast");
         return 3;
     }
-
+    ++l_time;
+    msg = adjust_local_time(msg);
     int *write_end = (int *) self;
     for (local_id id = 0; id <= children_cnt; ++id) {
         if (write_end[id] < 0) {
             continue;
         }
-        if (send(self, id, msg) != 0) {
+        if (process_send(self, id, msg) != 0) {
             return -1;
         }
     }
@@ -474,6 +496,11 @@ int receive(void *self, local_id from, Message *msg) {
         }
 
         return -1;
+    }
+
+    ++l_time;
+    if (l_time < msg->s_header.s_local_time) {
+        l_time = msg->s_header.s_local_time;
     }
 
     return 0;
