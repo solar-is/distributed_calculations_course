@@ -25,7 +25,7 @@ set follow-fork-mode child
 set detach-on-fork off
 
 to pack:
-tar -czvf pa2.tar.gz directory
+tar -czvf pa3.tar.gz pa3
 */
 
 FILE *events_log_fd;
@@ -34,7 +34,7 @@ local_id children_cnt;
 int pipe_write_ends[MAX_PROCESS_ID][MAX_PROCESS_ID];
 int pipe_read_ends[MAX_PROCESS_ID][MAX_PROCESS_ID];
 balance_t balances[MAX_PROCESS_ID];
-pid_t *pids;
+//pid_t *pids;
 
 timestamp_t l_time = 0;
 
@@ -45,7 +45,7 @@ timestamp_t get_lamport_time() {
 
 void die() {
     for (int i = 0; i < children_cnt; ++i) {
-        kill(pids[i], SIGKILL);
+        //kill(pids[i], SIGKILL);
     }
     exit(1);
 }
@@ -56,53 +56,6 @@ void print_error_and_die(char *format, ...) {
     vfprintf(stderr, format, argptr);
     va_end(argptr);
     die();
-}
-
-size_t payload_size(MessageType message_type) {
-    size_t result = -1;
-    if (message_type == ACK || message_type == STOP) {
-        result = 0;
-    } else if (message_type == TRANSFER) {
-        result = sizeof(TransferOrder);
-    } else if (message_type == STARTED) {
-        result = strlen("0: Process 0 (pid 00000, parent 00000) has STARTED with balance $00\n");
-    } else if (message_type == DONE) {
-        result = strlen("0: Process 0 has DONE with balance $00\n");
-    } else {
-        print_error_and_die("Unexpected message type: %d", message_type);
-    }
-    return result;
-}
-
-char *
-create_payload(MessageType message_type, local_id id, TransferOrder *transferOrder) {
-    char *payload = malloc(payload_size(message_type));
-    if (message_type == STARTED) {
-        sprintf(payload, log_started_fmt, get_lamport_time(), id, getpid(), getppid(), balances[id]);
-    } else if (message_type == DONE) {
-        sprintf(payload, log_done_fmt, get_lamport_time(), id, balances[id]);
-    } else if (message_type == TRANSFER) {
-        return (char *) transferOrder;
-    } else if (message_type == STOP || message_type == ACK) {
-        sprintf(payload, "");
-    } else {
-        print_error_and_die("Unexpected message type: %d", message_type);
-    }
-    return payload;
-}
-
-Message *
-create_message(MessageType message_type, local_id id, TransferOrder *transferOrder) {
-    char *payload = create_payload(message_type, id, transferOrder);
-    uint payload_len = strlen(payload);
-    Message *msg = malloc(sizeof(MessageHeader) + payload_len);
-    msg->s_header.s_payload_len = payload_len;
-    msg->s_header.s_local_time = get_lamport_time();
-    msg->s_header.s_type = message_type;
-    msg->s_header.s_magic = MESSAGE_MAGIC;
-    for (int i = 0; i < payload_len; i++)
-        msg->s_payload[i] = payload[i];
-    return msg;
 }
 
 int receive_sync(void *self, local_id id, Message *msg) {
@@ -116,16 +69,23 @@ int receive_sync(void *self, local_id id, Message *msg) {
 }
 
 void transfer(void *parent_data, local_id src, local_id dst, balance_t amount) {
-    TransferOrder *transfer_order = malloc(sizeof(TransferOrder));
+
+    //Message *msg = create_message(TRANSFER, PARENT_ID, &transfer_order);
+
+    Message msg;
+    msg.s_header.s_type = TRANSFER;
+    msg.s_header.s_magic = MESSAGE_MAGIC;
+    TransferOrder *transfer_order = (TransferOrder *) msg.s_payload;
     transfer_order->s_src = src;
     transfer_order->s_dst = dst;
     transfer_order->s_amount = amount;
-    Message *msg = create_message(TRANSFER, PARENT_ID, transfer_order);
+    msg.s_header.s_payload_len = sizeof(*transfer_order);
+
     //send request to src
-    send(pipe_write_ends[PARENT_ID], src, msg);
+    send(pipe_write_ends[PARENT_ID], src, &msg);
     //wait ACK from dst
-    receive_sync(pipe_read_ends[PARENT_ID], dst, msg);
-    if (msg->s_header.s_type != ACK) {
+    receive_sync(pipe_read_ends[PARENT_ID], dst, &msg);
+    if (msg.s_header.s_type != ACK) {
         print_error_and_die("Expected ACK message type");
     }
 }
@@ -251,7 +211,14 @@ void update_balance_history(local_id id, BalanceHistory *cur_balance_history, ti
 void children_routine(local_id id) {
     close_unused_pipe_ends(id);
     log_started(get_lamport_time(), id, balances[id]);
-    send_multicast(pipe_write_ends[id], create_message(STARTED, id, NULL));
+
+    Message msg;
+    msg.s_header.s_type = STARTED;
+    msg.s_header.s_magic = MESSAGE_MAGIC;
+    msg.s_header.s_payload_len = snprintf(msg.s_payload, MAX_PAYLOAD_LEN, log_started_fmt,
+                                          get_lamport_time(), id, getpid(), getppid(), balances[id]);
+
+    send_multicast(pipe_write_ends[id], &msg);
     wait_all_started_messages(id);
     log_receive_all_started(get_lamport_time(), id);
 
@@ -279,14 +246,23 @@ void children_routine(local_id id) {
                     for (int i = msg.s_header.s_local_time - 1; i < time; ++i) {
                         cur_balance_history.s_history[i].s_balance_pending_in += transfer->s_amount;
                     }
-                    send(pipe_write_ends[id], PARENT_ID, create_message(ACK, id, NULL));
+                    Message msg_ack;
+                    msg_ack.s_header.s_payload_len = 0;
+                    msg_ack.s_header.s_type = ACK;
+                    msg_ack.s_header.s_magic = MESSAGE_MAGIC;
+                    send(pipe_write_ends[id], PARENT_ID, &msg_ack);
                 }
                 break;
             }
             case STOP: {
                 ++ended_processes_cnt; //we are ended now
                 log_work_done(get_lamport_time(), id, balances[id]);
-                send_multicast(pipe_write_ends[id], create_message(DONE, id, NULL));
+                Message done_msg;
+                done_msg.s_header.s_magic = MESSAGE_MAGIC;
+                done_msg.s_header.s_type = DONE;
+                done_msg.s_header.s_payload_len = snprintf(done_msg.s_payload, MAX_PAYLOAD_LEN, log_done_fmt,
+                                                           get_lamport_time(), id, balances[id]);
+                send_multicast(pipe_write_ends[id], &done_msg);
                 break;
             }
             case DONE: {
@@ -304,10 +280,9 @@ void children_routine(local_id id) {
                     balance_history_msg.s_header.s_payload_len = offsetof(BalanceHistory, s_history) +
                                                                  sizeof(BalanceState) *
                                                                  cur_balance_history.s_history_len;
-                    char *history_as_char = (char *) &cur_balance_history;
-                    for (int i = 0; i < balance_history_msg.s_header.s_payload_len; ++i) {
-                        balance_history_msg.s_payload[i] = history_as_char[i];
-                    }
+
+                    memcpy(balance_history_msg.s_payload, &cur_balance_history,
+                           balance_history_msg.s_header.s_payload_len);
 
                     send(pipe_write_ends[id], PARENT_ID, &balance_history_msg);
                     close_used_pipe_ends(id);
@@ -321,13 +296,13 @@ void children_routine(local_id id) {
 }
 
 void init_children() {
-    pids = malloc(sizeof(pid_t) * children_cnt);
+    //pids = malloc(sizeof(pid_t) * children_cnt);
     for (local_id i = 0; i < children_cnt; i++) {
         //PARENT_ID is always 0, so we need to add 1
         local_id id = (local_id) (i + 1);
         int fork_res = fork();
         if (fork_res == 0) {
-            pids[i] = getpid();
+            //pids[i] = getpid();
             children_routine(id);
         }
     }
@@ -339,8 +314,12 @@ void parent_routine() {
 
     bank_robbery(NULL, children_cnt);
 
-    Message *msg = create_message(STOP, PARENT_ID, NULL);
-    send_multicast(pipe_write_ends[PARENT_ID], msg);
+    Message stop_msg;
+    stop_msg.s_header.s_magic = MESSAGE_MAGIC;
+    stop_msg.s_header.s_type = STOP;
+    stop_msg.s_header.s_payload_len = 0;
+
+    send_multicast(pipe_write_ends[PARENT_ID], &stop_msg);
 
     wait_all_done_messages(PARENT_ID);
 
@@ -417,9 +396,8 @@ int send(void *self, local_id dst, const Message *msg) {
     Message adjusted;
     adjusted.s_header = msg->s_header;
     adjusted.s_header.s_local_time = l_time;
-    for (int i = 0; i < msg->s_header.s_payload_len; ++i) {
-        adjusted.s_payload[i] = msg->s_payload[i];
-    }
+    memcpy(adjusted.s_payload, msg->s_payload, msg->s_header.s_payload_len);
+
     return process_send(self, dst, &adjusted);
 }
 
@@ -429,12 +407,12 @@ int send_multicast(void *self, const Message *msg) {
         return 3;
     }
     ++l_time;
+
     Message adjusted;
     adjusted.s_header = msg->s_header;
     adjusted.s_header.s_local_time = l_time;
-    for (int i = 0; i < msg->s_header.s_payload_len; ++i) {
-        adjusted.s_payload[i] = msg->s_payload[i];
-    }
+    memcpy(adjusted.s_payload, msg->s_payload, msg->s_header.s_payload_len);
+
     int *write_end = (int *) self;
     for (local_id id = 0; id <= children_cnt; ++id) {
         if (write_end[id] < 0) {
