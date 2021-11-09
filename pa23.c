@@ -34,7 +34,7 @@ local_id children_cnt;
 int pipe_write_ends[MAX_PROCESS_ID][MAX_PROCESS_ID];
 int pipe_read_ends[MAX_PROCESS_ID][MAX_PROCESS_ID];
 balance_t balances[MAX_PROCESS_ID];
-//pid_t *pids;
+pid_t *pids;
 
 timestamp_t l_time = 0;
 
@@ -42,10 +42,9 @@ timestamp_t get_lamport_time() {
     return l_time;
 }
 
-
 void die() {
     for (int i = 0; i < children_cnt; ++i) {
-        //kill(pids[i], SIGKILL);
+        kill(pids[i], SIGKILL);
     }
     exit(1);
 }
@@ -69,9 +68,6 @@ int receive_sync(void *self, local_id id, Message *msg) {
 }
 
 void transfer(void *parent_data, local_id src, local_id dst, balance_t amount) {
-
-    //Message *msg = create_message(TRANSFER, PARENT_ID, &transfer_order);
-
     Message msg;
     msg.s_header.s_type = TRANSFER;
     msg.s_header.s_magic = MESSAGE_MAGIC;
@@ -480,10 +476,10 @@ int receive(void *self, local_id from, Message *msg) {
         return -1;
     }
 
-    ++l_time;
     if (l_time < msg->s_header.s_local_time) {
         l_time = msg->s_header.s_local_time;
     }
+    ++l_time;
 
     return 0;
 }
