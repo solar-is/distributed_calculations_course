@@ -28,16 +28,6 @@ to pack:
 tar -czvf pa4.tar.gz pa4
 */
 
-struct queue {
-    local_id size;
-    struct {
-        local_id id;
-        timestamp_t time;
-    } item[MAX_PROCESS_ID + 1];
-};
-
-struct queue queues[MAX_PROCESS_ID];
-
 bool mutexl_parameter_presence = false;
 
 FILE *events_log_fd;
@@ -48,7 +38,9 @@ int pipe_read_ends[MAX_PROCESS_ID][MAX_PROCESS_ID];
 local_id started_counter[MAX_PROCESS_ID];
 local_id done_counter[MAX_PROCESS_ID];
 local_id replies_counter[MAX_PROCESS_ID];
-
+bool is_requsted_before[MAX_PROCESS_ID];
+bool is_pending[MAX_PROCESS_ID][MAX_PROCESS_ID + 1];
+timestamp_t times[MAX_PROCESS_ID];
 timestamp_t l_time = 0;
 
 timestamp_t get_lamport_time() {
@@ -129,36 +121,12 @@ void receive_message_and_get_src(void *read_end, Message *msg, local_id *src) {
     *src = (local_id) ret;
 }
 
-local_id find_queue_min(struct queue *queue) {
-    local_id min_id;
-    timestamp_t min_t_candidate = 32000;
-    local_id min_id_candidate = MAX_PROCESS_ID;
-    for (local_id i = 0; i < queue->size; ++i) {
-        if (min_t_candidate >= queue->item[i].time && (min_t_candidate != queue->item[i].time ||
-                                                       min_id_candidate >= queue->item[i].id)) {
-            min_t_candidate = queue->item[i].time;
-            min_id_candidate = queue->item[i].id;
-            min_id = i;
-        }
-    }
-    return min_id;
-}
-
-local_id look_queue_min(struct queue *queue) {
-    local_id min = find_queue_min(queue);
-    return queue->item[min].id;
-}
-
-void push(struct queue *queue, local_id id, timestamp_t t) {
-    queue->item[queue->size].id = id;
-    queue->item[queue->size].time = t;
-    ++queue->size;
-}
-
-void pop(struct queue *queue) {
-    local_id min = find_queue_min(queue);
-    --queue->size;
-    queue->item[min] = queue->item[queue->size];
+static bool send_cs_reply(local_id id, local_id dst) {
+    Message reply;
+    reply.s_header.s_type = CS_REPLY;
+    reply.s_header.s_payload_len = 0;
+    reply.s_header.s_magic = MESSAGE_MAGIC;
+    return send(pipe_write_ends[id], dst, &reply) >= 0;
 }
 
 void process_message_for(local_id id) {
@@ -173,15 +141,19 @@ void process_message_for(local_id id) {
             done_counter[id]++;
             break;
         case CS_REQUEST:
-            push(&(queues[id]), src, msg.s_header.s_local_time);
-            Message reply;
-            reply.s_header.s_magic = MESSAGE_MAGIC;
-            reply.s_header.s_type = CS_REPLY;
-            reply.s_header.s_payload_len = 0;
-            send(pipe_write_ends[id], src, &reply);
-            break;
-        case CS_RELEASE:
-            pop(&(queues[id]));
+            if (!is_requsted_before[id]) {
+                //not requesting before
+                send_cs_reply(id, src);
+            } else {
+                if ((times[id] == msg.s_header.s_local_time && id > src) ||
+                    times[id] > msg.s_header.s_local_time) {
+                    //requesting actually later
+                    send_cs_reply(id, src);
+                } else {
+                    //requesting before
+                    is_pending[id][src] = true;
+                }
+            }
             break;
         case CS_REPLY:
             replies_counter[id]++;
@@ -267,7 +239,7 @@ int main(int argc, char *argv[]) {
             mutexl_parameter_presence = true;
         }
         if (strcmp("-p", argv[i]) == 0) {
-            children_count = atoi(argv[i+1]);
+            children_count = atoi(argv[i + 1]);
         }
     }
     pipes_log_fd = fopen(pipes_log, "w");
@@ -431,9 +403,11 @@ int request_cs(const void *self) {
     request.s_header.s_payload_len = 0;
     request.s_header.s_magic = MESSAGE_MAGIC;
     send_multicast(pipe_write_ends[id], &request);
-    push(&(queues[id]), id, get_lamport_time());
     replies_counter[id] = 0;
-    while (replies_counter[id] < children_count - 1 || look_queue_min(&(queues[id])) != id) {
+    is_requsted_before[id] = true;
+    times[id] = get_lamport_time();
+    local_id replies = (local_id) (children_count - 1);
+    while (replies_counter[id] < replies) {
         process_message_for(id);
     }
     return 0;
@@ -444,10 +418,16 @@ int release_cs(const void *self) {
         return 1;
     }
     local_id id = *((local_id *) self);
-    pop(&(queues[id]));
-    Message release;
-    release.s_header.s_magic = MESSAGE_MAGIC;
-    release.s_header.s_type = CS_RELEASE;
-    release.s_header.s_payload_len = 0;
-    return send_multicast(pipe_write_ends[id], &release);
+    for (local_id i = 0; i <= children_count; ++i) {
+        if (is_pending[id][i]) {
+            Message msg;
+            msg.s_header.s_magic = MESSAGE_MAGIC;
+            msg.s_header.s_type = CS_REPLY;
+            msg.s_header.s_payload_len = 0;
+            send(pipe_write_ends[id], i, &msg);
+            is_pending[id][i] = false;
+        }
+    }
+    is_requsted_before[id] = false;
+    return 0;
 }
