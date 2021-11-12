@@ -262,15 +262,12 @@ void parent_routine() {
 }
 
 int main(int argc, char *argv[]) {
-    if (strcmp(argv[1], "-p") != 0) {
-        perror("First argument '-p' should be present - number of child processes");
-        exit(1);
-    } else {
-        children_count = atoi(argv[2]);
-    }
-    for (int i = 1; i < argc; ++i) {
+    for (int i = 0; i < argc; ++i) {
         if (strcmp("--mutexl", argv[i]) == 0) {
             mutexl_parameter_presence = true;
+        }
+        if (strcmp("-p", argv[i]) == 0) {
+            children_count = atoi(argv[i+1]);
         }
     }
     pipes_log_fd = fopen(pipes_log, "w");
