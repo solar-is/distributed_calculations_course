@@ -9,7 +9,6 @@ SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${LINK_FLAGS}")
 
 add_executable(distributed
         pa23.c
-        bank_robbery.c
         banking.h
         common.h
         ipc.h
