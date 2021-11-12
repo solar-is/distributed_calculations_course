@@ -9,7 +9,6 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <stdbool.h>
-#include <assert.h>
 
 #include "ipc.h"
 #include "common.h"
@@ -29,33 +28,26 @@ to pack:
 tar -czvf pa4.tar.gz pa4
 */
 
-struct mutex_queue {
+struct queue {
+    local_id size;
     struct {
         local_id id;
         timestamp_t time;
-    } buffer[MAX_PROCESS_ID + 1];
-
-    local_id current_size;
+    } item[MAX_PROCESS_ID + 1];
 };
 
-struct mutex_queue queues[MAX_PROCESS_ID];
+struct queue queues[MAX_PROCESS_ID];
 
-struct context {
-    local_id started;
-    local_id done;
-    local_id replies;
-};
-
-struct context contexts[MAX_PROCESS_ID];
+bool mutexl_parameter_presence = false;
 
 FILE *events_log_fd;
 FILE *pipes_log_fd;
 local_id children_count;
 int pipe_write_ends[MAX_PROCESS_ID][MAX_PROCESS_ID];
 int pipe_read_ends[MAX_PROCESS_ID][MAX_PROCESS_ID];
-//pid_t *pids;
-
-bool mutexl_parameter_presence = false;
+local_id started_counter[MAX_PROCESS_ID];
+local_id done_counter[MAX_PROCESS_ID];
+local_id replies_counter[MAX_PROCESS_ID];
 
 timestamp_t l_time = 0;
 
@@ -63,163 +55,13 @@ timestamp_t get_lamport_time() {
     return l_time;
 }
 
-/*void die() {
-    for (int i = 0; i < children_count; ++i) {
-        if (pids[i] != getpid()) {
-            kill(pids[i], SIGKILL);
-        }
-    }
-    exit(1);
-}*/
-
 void print_error_and_die(char *format, ...) {
     va_list argptr;
     va_start(argptr, format);
     vfprintf(stderr, format, argptr);
     va_end(argptr);
     exit(1);
-    //die();
 }
-
-/*int receive_sync(void *self, local_id id, Message *msg) {
-    while (1) {
-        const int ret = receive(self, id, msg);
-        if (ret != 0 && errno == EAGAIN) {
-            continue;
-        }
-        return ret;
-    }
-}*/
-
-local_id mutex_queue_find_min(struct mutex_queue *queue) {
-    assert(queue->current_size > 0);
-
-    local_id min_i;
-    timestamp_t min_t = 32767;
-    local_id min_id = MAX_PROCESS_ID;
-    for (local_id i = 0; i < queue->current_size; ++i) {
-        if (min_t < queue->buffer[i].time) {
-            continue;
-        }
-
-        if (min_t == queue->buffer[i].time && min_id < queue->buffer[i].id) {
-            continue;
-        }
-
-        min_t = queue->buffer[i].time;
-        min_id = queue->buffer[i].id;
-        min_i = i;
-    }
-
-    return min_i;
-}
-
-local_id mutex_queue_peek(struct mutex_queue *queue) {
-    return queue->buffer[mutex_queue_find_min(queue)].id;
-}
-
-void mutex_queue_push(struct mutex_queue *queue, local_id id, timestamp_t t) {
-    assert(queue->current_size <= MAX_PROCESS_ID);
-
-    queue->buffer[queue->current_size].id = id;
-    queue->buffer[queue->current_size].time = t;
-    ++queue->current_size;
-}
-
-void mutex_queue_pop(struct mutex_queue *queue, local_id id) {
-    const local_id min = mutex_queue_find_min(queue);
-    assert(queue->buffer[min].id == id);
-
-    --queue->current_size;
-    queue->buffer[min] = queue->buffer[queue->current_size];
-}
-
-bool receive_next_message(void *read_end, Message *msg, local_id *src) {
-    const int ret = receive_any(read_end, msg);
-
-    if (ret < 0) {
-        return false;
-    }
-
-    if (src) {
-        *src = (local_id) ret;
-    }
-
-    return true;
-}
-
-bool handle_next_message(local_id id) {
-    local_id src;
-    Message msg;
-
-    if (!receive_next_message(pipe_read_ends[id], &msg, &src)) {
-        return false;
-    }
-
-    switch (msg.s_header.s_type) {
-        case STARTED:
-            contexts[id].started++;
-            break;
-
-        case DONE:
-            contexts[id].done++;
-            break;
-
-        case CS_REQUEST:
-            mutex_queue_push(&(queues[id]), src, msg.s_header.s_local_time);
-
-            {
-                Message reply;
-                reply.s_header.s_magic = MESSAGE_MAGIC;
-                reply.s_header.s_type = CS_REPLY;
-                reply.s_header.s_payload_len = 0;
-
-                if (send(pipe_write_ends[id], src, &reply) < 0) {
-                    return false;
-                }
-            }
-            break;
-
-        case CS_REPLY:
-            contexts[id].replies++;
-            break;
-
-        case CS_RELEASE:
-            mutex_queue_pop(&(queues[id]), src);
-            break;
-
-        default:
-            errno = EINVAL;
-            return false;
-    }
-
-    return true;
-}
-
-/*Message receive_particular_message_or_die(local_id id, local_id from_id, MessageType message_type) {
-    Message msg;
-    receive_sync(pipe_read_ends[id], from_id, &msg);
-    if (msg.s_header.s_type != message_type) {
-        print_error_and_die("Expected %d message type, but was %d", message_type, msg.s_header.s_type);
-    }
-    return msg;
-}
-
-void wait_all_started_messages(local_id id) {
-    for (local_id i = 1; i <= children_count; ++i) {
-        if (i != id) {
-            receive_particular_message_or_die(id, i, STARTED);
-        }
-    }
-}
-
-void wait_all_done_messages(local_id id) {
-    for (local_id i = 1; i <= children_count; ++i) {
-        if (i != id) {
-            receive_particular_message_or_die(id, i, DONE);
-        }
-    }
-}*/
 
 void log_started(timestamp_t timestamp, local_id id, balance_t balance) {
     printf(log_started_fmt, timestamp, id, getpid(), getppid(), balance);
@@ -282,9 +124,75 @@ void close_used_pipe_ends(local_id id) {
     }
 }
 
-bool phase_started(local_id id) {
-    log_started(get_lamport_time(), id, 0);
+void receive_message_and_get_src(void *read_end, Message *msg, local_id *src) {
+    int ret = receive_any(read_end, msg);
+    *src = (local_id) ret;
+}
 
+local_id find_queue_min(struct queue *queue) {
+    local_id min_id;
+    timestamp_t min_t_candidate = 32000;
+    local_id min_id_candidate = MAX_PROCESS_ID;
+    for (local_id i = 0; i < queue->size; ++i) {
+        if (min_t_candidate >= queue->item[i].time && (min_t_candidate != queue->item[i].time ||
+                                                       min_id_candidate >= queue->item[i].id)) {
+            min_t_candidate = queue->item[i].time;
+            min_id_candidate = queue->item[i].id;
+            min_id = i;
+        }
+    }
+    return min_id;
+}
+
+local_id look_queue_min(struct queue *queue) {
+    local_id min = find_queue_min(queue);
+    return queue->item[min].id;
+}
+
+void push(struct queue *queue, local_id id, timestamp_t t) {
+    queue->item[queue->size].id = id;
+    queue->item[queue->size].time = t;
+    ++queue->size;
+}
+
+void pop(struct queue *queue) {
+    local_id min = find_queue_min(queue);
+    --queue->size;
+    queue->item[min] = queue->item[queue->size];
+}
+
+void process_message_for(local_id id) {
+    local_id src;
+    Message msg;
+    receive_message_and_get_src(pipe_read_ends[id], &msg, &src);
+    switch (msg.s_header.s_type) {
+        case STARTED:
+            started_counter[id]++;
+            break;
+        case DONE:
+            done_counter[id]++;
+            break;
+        case CS_REQUEST:
+            push(&(queues[id]), src, msg.s_header.s_local_time);
+            Message reply;
+            reply.s_header.s_magic = MESSAGE_MAGIC;
+            reply.s_header.s_type = CS_REPLY;
+            reply.s_header.s_payload_len = 0;
+            send(pipe_write_ends[id], src, &reply);
+            break;
+        case CS_RELEASE:
+            pop(&(queues[id]));
+            break;
+        case CS_REPLY:
+            replies_counter[id]++;
+            break;
+    }
+}
+
+void children_routine(local_id id) {
+    close_unused_pipe_ends(id);
+
+    log_started(get_lamport_time(), id, 0);
     Message msg;
     msg.s_header.s_type = STARTED;
     msg.s_header.s_magic = MESSAGE_MAGIC;
@@ -292,80 +200,33 @@ bool phase_started(local_id id) {
                                           get_lamport_time(), id, getpid(), getppid(), 0);
     send_multicast(pipe_write_ends[id], &msg);
 
-    const local_id needed_started = (local_id) (children_count - 1);
-    while (contexts[id].started < needed_started) {
-        if (!handle_next_message(id)) {
-            return false;
-        }
+    local_id need_to_wait = (local_id) (children_count - 1);
+    while (started_counter[id] < need_to_wait) {
+        process_message_for(id);
     }
-
     log_receive_all_started(get_lamport_time(), id);
-    return true;
-}
 
-bool phase_work(local_id id) {
-    int print_amount = id * 5;
-
-    for (unsigned int i = 1; i <= print_amount; ++i) {
-        if (mutexl_parameter_presence) {
-            if (request_cs(&id) < 0) {
-                return false;
-            }
-        }
-
-        char str[256];
-        snprintf(str, 256, log_loop_operation_fmt, id, i, print_amount);
-        print(str);
-
-        if (mutexl_parameter_presence) {
-            if (release_cs(&id) < 0) {
-                return false;
-            }
-        }
+    for (int i = 1; i <= id * 5; ++i) {
+        request_cs(&id);
+        char loop_str[256];
+        snprintf(loop_str, 256, log_loop_operation_fmt, id, i, id * 5);
+        print(loop_str);
+        release_cs(&id);
     }
-
-    return true;
-}
-
-bool phase_done(local_id id) {
     log_work_done(get_lamport_time(), id, 0);
 
     Message done_msg;
-    done_msg.s_header.s_magic = MESSAGE_MAGIC;
     done_msg.s_header.s_type = DONE;
+    done_msg.s_header.s_magic = MESSAGE_MAGIC;
     done_msg.s_header.s_payload_len = snprintf(done_msg.s_payload, MAX_PAYLOAD_LEN,
                                                log_done_fmt, get_lamport_time(), id, 0);
     send_multicast(pipe_write_ends[id], &done_msg);
-
-    // N - parent - me
-    const local_id needed_done = (local_id) (children_count - 1);
-    while (contexts[id].done < needed_done) {
-        if (!handle_next_message(id)) {
-            return false;
-        }
+    while (done_counter[id] < need_to_wait) {
+        process_message_for(id);
     }
 
     log_receive_all_done(get_lamport_time(), id);
-    return true;
-}
-
-void children_routine(local_id id) {
-    close_unused_pipe_ends(id);
-
-    if (!phase_started(id)) {
-        print_error_and_die("phase_started");
-    }
-
-    if (!phase_work(id)) {
-        print_error_and_die("phase_work");
-    }
-
-    if (!phase_done(id)) {
-        print_error_and_die("phase_done");
-    }
-
     close_used_pipe_ends(id);
-
     exit(0);
 }
 
@@ -382,29 +243,18 @@ void init_children() {
 
 void parent_routine() {
     close_unused_pipe_ends(PARENT_ID);
-
-    const local_id needed = (local_id) (children_count - 1);
-    local_id started = 0, done = 0;
-
-    while (started < needed || done < needed) {
-        local_id src;
+    local_id needed = (local_id) ((children_count - 1) * 2);
+    local_id received = 0;
+    while (received < needed) {
         Message msg;
-
-        if (!receive_next_message(pipe_read_ends[PARENT_ID], &msg, &src)) {
-            print_error_and_die("receive_next_message(pipe_read_ends[PARENT_ID]");
+        if (!receive_any(pipe_read_ends[PARENT_ID], &msg)) {
+            print_error_and_die("Can't receive message for parent");
         }
-
-        switch (msg.s_header.s_type) {
-            case STARTED:
-                ++started;
-                break;
-
-            case DONE:
-                ++done;
-                break;
+        MessageType type = msg.s_header.s_type;
+        if (type == STARTED || type == DONE) {
+            ++received;
         }
     }
-
     for (int i = 0; i < children_count; ++i) {
         waitpid(-1, NULL, 0);
     }
@@ -418,17 +268,11 @@ int main(int argc, char *argv[]) {
     } else {
         children_count = atoi(argv[2]);
     }
-
     for (int i = 1; i < argc; ++i) {
         if (strcmp("--mutexl", argv[i]) == 0) {
             mutexl_parameter_presence = true;
         }
     }
-
-    for (int i = 0; i < MAX_PROCESS_ID; ++i) {
-        queues[i].current_size = 0;
-    }
-
     pipes_log_fd = fopen(pipes_log, "w");
     events_log_fd = fopen(events_log, "a");
     init_pipes();
@@ -441,7 +285,7 @@ int main(int argc, char *argv[]) {
 int process_send(void *self, local_id dst, const Message *msg) {
     int *write_end = (int *) self;
     char *message_ptr = (char *) msg;
-    ssize_t rem = (ssize_t)(sizeof(MessageHeader) + msg->s_header.s_payload_len);
+    ssize_t rem = (ssize_t) (sizeof(MessageHeader) + msg->s_header.s_payload_len);
     while (1) {
         ssize_t written = write(write_end[dst], message_ptr, rem);
         if (written < 0) {
@@ -581,52 +425,32 @@ int receive_any(void *self, Message *msg) {
 }
 
 int request_cs(const void *self) {
+    if (!mutexl_parameter_presence) {
+        return 1;
+    }
     local_id id = *((local_id *) self);
-
-    {
-        Message msg;
-        msg.s_header.s_magic = MESSAGE_MAGIC;
-        msg.s_header.s_type = CS_REQUEST;
-        msg.s_header.s_payload_len = 0;
-
-        const int ret = send_multicast(pipe_write_ends[id], &msg);
-        if (ret < 0) {
-            return ret;
-        }
+    Message request;
+    request.s_header.s_type = CS_REQUEST;
+    request.s_header.s_payload_len = 0;
+    request.s_header.s_magic = MESSAGE_MAGIC;
+    send_multicast(pipe_write_ends[id], &request);
+    push(&(queues[id]), id, get_lamport_time());
+    replies_counter[id] = 0;
+    while (replies_counter[id] < children_count - 1 || look_queue_min(&(queues[id])) != id) {
+        process_message_for(id);
     }
-
-    mutex_queue_push(&(queues[id]), id, get_lamport_time());
-    contexts[id].replies = 0;
-
-    // N - parent - me
-    const local_id needed_replies = (local_id) (children_count - 1);
-    while (contexts[id].replies < needed_replies ||
-           mutex_queue_peek(&(queues[id])) != id) {
-        if (!handle_next_message(id)) {
-            return -1;
-        }
-    }
-
     return 0;
 }
 
 int release_cs(const void *self) {
+    if (!mutexl_parameter_presence) {
+        return 1;
+    }
     local_id id = *((local_id *) self);
-
-    if (queues[id].current_size == 0) {
-        return -1;
-    }
-
-    if (mutex_queue_peek(&(queues[id])) != id) {
-        return -2;
-    }
-
-    mutex_queue_pop(&(queues[id]), id);
-
-    Message msg;
-    msg.s_header.s_magic = MESSAGE_MAGIC;
-    msg.s_header.s_type = CS_RELEASE;
-    msg.s_header.s_payload_len = 0;
-
-    return send_multicast(pipe_write_ends[id], &msg);
+    pop(&(queues[id]));
+    Message release;
+    release.s_header.s_magic = MESSAGE_MAGIC;
+    release.s_header.s_type = CS_RELEASE;
+    release.s_header.s_payload_len = 0;
+    return send_multicast(pipe_write_ends[id], &release);
 }

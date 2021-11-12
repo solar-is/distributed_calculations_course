@@ -47,7 +47,7 @@ enum {
 typedef struct {
     local_id        s_id;
     uint8_t         s_history_len;
-    BalanceState    s_history[MAX_T + 1]; ///< Must be used as a buffer, unused
+    BalanceState    s_history[MAX_T + 1]; ///< Must be used as a item, unused
                                           ///< part of array shouldn't be transfered
 } __attribute__((packed)) BalanceHistory;
 
