@@ -34,68 +34,13 @@ local_id children_cnt;
 int pipe_write_ends[MAX_PROCESS_ID][MAX_PROCESS_ID];
 int pipe_read_ends[MAX_PROCESS_ID][MAX_PROCESS_ID];
 balance_t balances[MAX_PROCESS_ID];
-pid_t *pids;
-
-void die() {
-    for (int i = 0; i < children_cnt; ++i) {
-        kill(pids[i], SIGKILL);
-    }
-    exit(1);
-}
 
 void print_error_and_die(char *format, ...) {
     va_list argptr;
     va_start(argptr, format);
     vfprintf(stderr, format, argptr);
     va_end(argptr);
-    die();
-}
-
-size_t payload_size(MessageType message_type) {
-    size_t result = -1;
-    if (message_type == ACK || message_type == STOP) {
-        result = 0;
-    } else if (message_type == TRANSFER) {
-        result = sizeof(TransferOrder);
-    } else if (message_type == STARTED) {
-        result = strlen("0: Process 0 (pid 00000, parent 00000) has STARTED with balance $00\n");
-    } else if (message_type == DONE) {
-        result = strlen("0: Process 0 has DONE with balance $00\n");
-    } else {
-        print_error_and_die("Unexpected message type: %d", message_type);
-    }
-    return result;
-}
-
-char *
-create_payload(MessageType message_type, local_id id, TransferOrder *transferOrder) {
-    char *payload = malloc(payload_size(message_type));
-    if (message_type == STARTED) {
-        sprintf(payload, log_started_fmt, get_physical_time(), id, getpid(), getppid(), balances[id]);
-    } else if (message_type == DONE) {
-        sprintf(payload, log_done_fmt, get_physical_time(), id, balances[id]);
-    } else if (message_type == TRANSFER) {
-        return (char *) transferOrder;
-    } else if (message_type == STOP || message_type == ACK) {
-        sprintf(payload, "");
-    } else {
-        print_error_and_die("Unexpected message type: %d", message_type);
-    }
-    return payload;
-}
-
-Message *
-create_message(MessageType message_type, local_id id, TransferOrder *transferOrder) {
-    char *payload = create_payload(message_type, id, transferOrder);
-    uint payload_len = strlen(payload);
-    Message *msg = malloc(sizeof(MessageHeader) + payload_len);
-    msg->s_header.s_payload_len = payload_len;
-    msg->s_header.s_local_time = get_physical_time();
-    msg->s_header.s_type = message_type;
-    msg->s_header.s_magic = MESSAGE_MAGIC;
-    for (int i = 0; i < payload_len; i++)
-        msg->s_payload[i] = payload[i];
-    return msg;
+    exit(1);
 }
 
 int receive_sync(void *self, local_id id, Message *msg) {
@@ -109,16 +54,27 @@ int receive_sync(void *self, local_id id, Message *msg) {
 }
 
 void transfer(void *parent_data, local_id src, local_id dst, balance_t amount) {
-    TransferOrder *transfer_order = malloc(sizeof(TransferOrder));
-    transfer_order->s_src = src;
-    transfer_order->s_dst = dst;
-    transfer_order->s_amount = amount;
-    Message *msg = create_message(TRANSFER, PARENT_ID, transfer_order);
+    TransferOrder transfer_order;
+    transfer_order.s_src = src;
+    transfer_order.s_dst = dst;
+    transfer_order.s_amount = amount;
+
+    Message msg;
+    msg.s_header.s_type = TRANSFER;
+    msg.s_header.s_magic = MESSAGE_MAGIC;
+    msg.s_header.s_payload_len = sizeof(transfer_order);
+    char *transfer_as_char = (char *) &transfer_order;
+    for (int i = 0; i < msg.s_header.s_payload_len; ++i) {
+        msg.s_payload[i] = transfer_as_char[i];
+    }
+
+    memcpy(msg.s_payload, &transfer_order, sizeof(transfer_order));
+
     //send request to src
-    send(pipe_write_ends[PARENT_ID], src, msg);
+    send(pipe_write_ends[PARENT_ID], src, &msg);
     //wait ACK from dst
-    receive_sync(pipe_read_ends[PARENT_ID], dst, msg);
-    if (msg->s_header.s_type != ACK) {
+    receive_sync(pipe_read_ends[PARENT_ID], dst, &msg);
+    if (msg.s_header.s_type != ACK) {
         print_error_and_die("Expected ACK message type");
     }
 }
@@ -210,9 +166,10 @@ void init_pipes() {
     fclose(pipes_log_fd); //not useful anymore
 }
 
-void close_pipe_end(const int *pipe_end) {
+void close_pipe_end(int *pipe_end) {
     if (*pipe_end > 0) {
         close(*pipe_end);
+        *pipe_end = -1;
     }
 }
 
@@ -244,7 +201,14 @@ void update_balance_history(local_id id, BalanceHistory *cur_balance_history, ti
 void children_routine(local_id id) {
     close_unused_pipe_ends(id);
     log_started(get_physical_time(), id, balances[id]);
-    send_multicast(pipe_write_ends[id], create_message(STARTED, id, NULL));
+
+    Message started_msg;
+    started_msg.s_header.s_type = STARTED;
+    started_msg.s_header.s_magic = MESSAGE_MAGIC;
+    started_msg.s_header.s_payload_len = snprintf(started_msg.s_payload, MAX_PAYLOAD_LEN, log_started_fmt,
+                                                  get_physical_time(), id, getpid(), getppid(), balances[id]);
+    send_multicast(pipe_write_ends[id], &started_msg);
+
     wait_all_started_messages(id);
     log_receive_all_started(get_physical_time(), id);
 
@@ -269,14 +233,22 @@ void children_routine(local_id id) {
                 } else {
                     log_transfer_in(t, id, transfer->s_src, transfer->s_amount);
                     balances[id] += transfer->s_amount;
-                    send(pipe_write_ends[id], PARENT_ID, create_message(ACK, id, NULL));
+                    Message ack;
+                    ack.s_header.s_type = ACK;
+                    ack.s_header.s_magic = MESSAGE_MAGIC;
+                    ack.s_header.s_payload_len = 0;
+                    send(pipe_write_ends[id], PARENT_ID, &ack);
                 }
                 break;
             }
             case STOP: {
                 ++ended_processes_cnt; //we are ended now
                 log_work_done(get_physical_time(), id, balances[id]);
-                send_multicast(pipe_write_ends[id], create_message(DONE, id, NULL));
+                Message done;
+                done.s_header.s_type = DONE;
+                done.s_header.s_magic = MESSAGE_MAGIC;
+                done.s_header.s_payload_len = snprintf(done.s_payload, MAX_PAYLOAD_LEN, log_done_fmt, get_physical_time(), id, balances[id]);
+                send_multicast(pipe_write_ends[id], &done);
                 break;
             }
             case DONE: {
@@ -311,13 +283,11 @@ void children_routine(local_id id) {
 }
 
 void init_children() {
-    pids = malloc(sizeof(pid_t) * children_cnt);
     for (local_id i = 0; i < children_cnt; i++) {
         //PARENT_ID is always 0, so we need to add 1
         local_id id = (local_id) (i + 1);
         int fork_res = fork();
         if (fork_res == 0) {
-            pids[i] = getpid();
             children_routine(id);
         }
     }
@@ -329,8 +299,11 @@ void parent_routine() {
 
     bank_robbery(NULL, children_cnt);
 
-    Message *msg = create_message(STOP, PARENT_ID, NULL);
-    send_multicast(pipe_write_ends[PARENT_ID], msg);
+    Message msg;
+    msg.s_header.s_type = STOP;
+    msg.s_header.s_magic = MESSAGE_MAGIC;
+    msg.s_header.s_payload_len = 0;
+    send_multicast(pipe_write_ends[PARENT_ID], &msg);
 
     wait_all_done_messages(PARENT_ID);
 
@@ -339,15 +312,8 @@ void parent_routine() {
     wait_balance_history_messages(PARENT_ID, &all_history);
     print_history(&all_history);
 
-    while (1) {
-        if (children_cnt == 0) {
-            //no more to wait
-            break;
-        }
-
-        if (waitpid(-1, NULL, 0) > 0) {
-            children_cnt--;
-        }
+    for (int i = 0; i < children_cnt; ++i) {
+        waitpid(-1, NULL, 0);
     }
     close_used_pipe_ends(PARENT_ID);
 }
