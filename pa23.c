@@ -34,7 +34,6 @@ local_id children_cnt;
 int pipe_write_ends[MAX_PROCESS_ID][MAX_PROCESS_ID];
 int pipe_read_ends[MAX_PROCESS_ID][MAX_PROCESS_ID];
 balance_t balances[MAX_PROCESS_ID];
-pid_t *pids;
 
 timestamp_t l_time = 0;
 
@@ -42,19 +41,12 @@ timestamp_t get_lamport_time() {
     return l_time;
 }
 
-void die() {
-    for (int i = 0; i < children_cnt; ++i) {
-        kill(pids[i], SIGKILL);
-    }
-    exit(1);
-}
-
 void print_error_and_die(char *format, ...) {
     va_list argptr;
     va_start(argptr, format);
     vfprintf(stderr, format, argptr);
     va_end(argptr);
-    die();
+    exit(1);
 }
 
 int receive_sync(void *self, local_id id, Message *msg) {
@@ -292,13 +284,11 @@ void children_routine(local_id id) {
 }
 
 void init_children() {
-    //pids = malloc(sizeof(pid_t) * children_cnt);
     for (local_id i = 0; i < children_cnt; i++) {
         //PARENT_ID is always 0, so we need to add 1
         local_id id = (local_id) (i + 1);
         int fork_res = fork();
         if (fork_res == 0) {
-            //pids[i] = getpid();
             children_routine(id);
         }
     }
